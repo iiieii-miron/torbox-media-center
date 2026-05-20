@@ -144,9 +144,14 @@ class TorBoxMediaCenterFuse(Fuse):
         self.next_handle = 1
         self.cached_links = {}
 
-        self.cache = {}
+        self.block_cache = {}
+        self.slice_cache = {}
+        self.cache_lock = threading.Lock()
+        self.inflight_prefetch = {}
         self.block_size = 1024 * 1024 * 64  # 64MB Blocks
+        self.foreground_window_size = 1024 * 1024  # 1MB foreground read-ahead
         self.max_blocks = 64 # Max 64 blocks in cache (4GB)
+        self.max_slice_segments = 128
 
     def getFiles(self):
         while True:
@@ -198,15 +203,116 @@ class TorBoxMediaCenterFuse(Fuse):
         if (flags & accmode) != os.O_RDONLY:
             return -errno.EACCES
     
+    def _trim_caches(self):
+        block_limit = self.max_blocks * max(1, len(self.cached_links))
+        if len(self.block_cache) > block_limit:
+            keys_to_remove = sorted(
+                self.block_cache.keys(),
+                key=lambda key: self.block_cache[key]['last_used']
+            )[:len(self.block_cache) - block_limit]
+            for key in keys_to_remove:
+                del self.block_cache[key]
+
+        total_segments = sum(len(segments) for segments in self.slice_cache.values())
+        slice_limit = self.max_slice_segments * max(1, len(self.cached_links))
+        if total_segments > slice_limit:
+            all_segments = []
+            for path_key, segments in self.slice_cache.items():
+                for index, segment in enumerate(segments):
+                    all_segments.append((segment['last_used'], path_key, index))
+            all_segments.sort(key=lambda item: item[0])
+            to_remove = total_segments - slice_limit
+            removals = {}
+            for _, path_key, index in all_segments[:to_remove]:
+                removals.setdefault(path_key, set()).add(index)
+            for path_key, indexes in removals.items():
+                self.slice_cache[path_key] = [
+                    segment for idx, segment in enumerate(self.slice_cache[path_key])
+                    if idx not in indexes
+                ]
+                if not self.slice_cache[path_key]:
+                    del self.slice_cache[path_key]
+
+    def _store_block(self, path, block_index, data):
+        self.block_cache[(path, block_index)] = {
+            'data': data,
+            'last_used': time.time(),
+        }
+
+    def _get_block(self, path, block_index):
+        entry = self.block_cache.get((path, block_index))
+        if entry is None:
+            return None
+        entry['last_used'] = time.time()
+        return entry['data']
+
+    def _store_slice(self, path, start, data):
+        segment = {
+            'start': start,
+            'end': start + len(data) - 1,
+            'data': data,
+            'last_used': time.time(),
+        }
+        segments = self.slice_cache.setdefault(path, [])
+        segments.append(segment)
+        segments.sort(key=lambda item: item['start'])
+
+    def _get_slice(self, path, offset, size):
+        request_end = offset + size - 1
+        for segment in self.slice_cache.get(path, []):
+            if segment['start'] <= offset and request_end <= segment['end']:
+                segment['last_used'] = time.time()
+                start = offset - segment['start']
+                end = start + size
+                return bytes(segment['data'][start:end])
+        return None
+
+    def _prefetch_block(self, path, block_index, download_link, block_offset, block_size, event):
+        started_at = time.time()
+        try:
+            logging.info(
+                f"SEEKTRACE prefetch-start path={path} block={block_index} offset={block_offset} size={block_size}"
+            )
+            data = downloadFile(download_link, block_size, block_offset)
+            if data:
+                with self.cache_lock:
+                    self._store_block(path, block_index, data)
+                    self._trim_caches()
+                logging.info(
+                    f"SEEKTRACE prefetch-done path={path} block={block_index} offset={block_offset} size={block_size} received={len(data)} elapsed={time.time() - started_at:.3f}s"
+                )
+        except Exception as e:
+            logging.warning(
+                f"SEEKTRACE prefetch-error path={path} block={block_index} offset={block_offset} size={block_size} error={e}"
+            )
+        finally:
+            with self.cache_lock:
+                self.inflight_prefetch.pop((path, block_index), None)
+            event.set()
+
+    def _ensure_prefetch(self, path, block_index, download_link, block_offset, block_size):
+        with self.cache_lock:
+            if (path, block_index) in self.block_cache or (path, block_index) in self.inflight_prefetch:
+                return
+            event = threading.Event()
+            self.inflight_prefetch[(path, block_index)] = event
+        threading.Thread(
+            target=self._prefetch_block,
+            args=(path, block_index, download_link, block_offset, block_size, event),
+            daemon=True,
+        ).start()
+
     def read(self, path, size, offset):
-        logging.debug(f"READ Path: {path}")
-        logging.debug(f"READ Size: {size}")
-        logging.debug(f"READ Offset: {offset}")
         file = self.vfs.get_file(path)
 
         if not file:
             return -errno.ENOENT
-        
+
+        file_size = file.get('file_size', 0)
+        if offset >= file_size:
+            return b''
+
+        size = min(size, file_size - offset)
         current_time = time.time()
         if path not in self.cached_links:
             self.cached_links[path] = {
@@ -220,39 +326,53 @@ class TorBoxMediaCenterFuse(Fuse):
                 'timestamp': current_time
             }
         download_link = self.cached_links[path]['link']
-        
+
         start_block = offset // self.block_size
         end_block = (offset + size - 1) // self.block_size
-        
         buffer = bytearray()
-        
+
         for block_index in range(start_block, end_block + 1):
             block_offset = block_index * self.block_size
-            block_end = min((block_index + 1) * self.block_size - 1, file.get('file_size') - 1)
+            block_end = min((block_index + 1) * self.block_size - 1, file_size - 1)
             current_block_size = block_end - block_offset + 1
-            
-            # check for block
-            if (path, block_index) not in self.cache:
-                logging.debug(f"Cache miss for block {block_index}, fetching...")
-                # get block
-                block_data = downloadFile(download_link, current_block_size, block_offset)
-                if not block_data:
-                    return -errno.EIO
-                # save block to cache
-                self.cache[(path, block_index)] = block_data
-                # lru cache
-                if len(self.cache) > self.max_blocks * len(self.cached_links):
-                    keys_to_remove = list(self.cache.keys())[:len(self.cache) - self.max_blocks]
-                    for key in keys_to_remove:
-                        del self.cache[key]
-            # get block from cache
-            block_data = self.cache[(path, block_index)]
-            
-            start_offset_in_block = max(0, offset - block_offset)
-            end_offset_in_block = min(len(block_data), offset + size - block_offset)
-            
-            buffer.extend(block_data[start_offset_in_block:end_offset_in_block])
-        
+            request_start = max(offset, block_offset)
+            request_end = min(offset + size - 1, block_end)
+            request_size = request_end - request_start + 1
+
+            with self.cache_lock:
+                block_data = self._get_block(path, block_index)
+                if block_data is None:
+                    slice_data = self._get_slice(path, request_start, request_size)
+                else:
+                    slice_data = None
+
+            if block_data is not None:
+                start_offset_in_block = request_start - block_offset
+                end_offset_in_block = start_offset_in_block + request_size
+                buffer.extend(block_data[start_offset_in_block:end_offset_in_block])
+                continue
+
+            if slice_data is not None:
+                buffer.extend(slice_data)
+                continue
+
+            fetch_size = min(max(request_size, self.foreground_window_size), block_end - request_start + 1)
+            started_at = time.time()
+            logging.info(
+                f"SEEKTRACE miss path={path} block={block_index} offset={request_start} size={request_size} fetch_size={fetch_size}"
+            )
+            data = downloadFile(download_link, fetch_size, request_start)
+            if not data:
+                return -errno.EIO
+            with self.cache_lock:
+                self._store_slice(path, request_start, data)
+                self._trim_caches()
+            logging.info(
+                f"SEEKTRACE fetch-done path={path} block={block_index} offset={request_start} size={request_size} fetch_size={fetch_size} received={len(data)} elapsed={time.time() - started_at:.3f}s"
+            )
+            buffer.extend(data[:request_size])
+            self._ensure_prefetch(path, block_index, download_link, block_offset, current_block_size)
+
         return bytes(buffer)
     
     def release(self, _, fh):
