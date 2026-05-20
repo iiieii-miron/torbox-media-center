@@ -206,11 +206,7 @@ class TorBoxMediaCenterFuse(Fuse):
 
         if not file:
             return -errno.ENOENT
-
-        file_size = file.get('file_size', 0)
-        if offset >= file_size:
-            return b""
-
+        
         current_time = time.time()
         if path not in self.cached_links:
             self.cached_links[path] = {
@@ -223,15 +219,41 @@ class TorBoxMediaCenterFuse(Fuse):
                 'link': download_link,
                 'timestamp': current_time
             }
-
         download_link = self.cached_links[path]['link']
-        read_size = min(size, file_size - offset)
-
-        try:
-            return downloadFile(download_link, read_size, offset)
-        except Exception as e:
-            logging.error(f"Error reading file {path} at offset {offset} size {read_size}: {e}")
-            return -errno.EIO
+        
+        start_block = offset // self.block_size
+        end_block = (offset + size - 1) // self.block_size
+        
+        buffer = bytearray()
+        
+        for block_index in range(start_block, end_block + 1):
+            block_offset = block_index * self.block_size
+            block_end = min((block_index + 1) * self.block_size - 1, file.get('file_size') - 1)
+            current_block_size = block_end - block_offset + 1
+            
+            # check for block
+            if (path, block_index) not in self.cache:
+                logging.debug(f"Cache miss for block {block_index}, fetching...")
+                # get block
+                block_data = downloadFile(download_link, current_block_size, block_offset)
+                if not block_data:
+                    return -errno.EIO
+                # save block to cache
+                self.cache[(path, block_index)] = block_data
+                # lru cache
+                if len(self.cache) > self.max_blocks * len(self.cached_links):
+                    keys_to_remove = list(self.cache.keys())[:len(self.cache) - self.max_blocks]
+                    for key in keys_to_remove:
+                        del self.cache[key]
+            # get block from cache
+            block_data = self.cache[(path, block_index)]
+            
+            start_offset_in_block = max(0, offset - block_offset)
+            end_offset_in_block = min(len(block_data), offset + size - block_offset)
+            
+            buffer.extend(block_data[start_offset_in_block:end_offset_in_block])
+        
+        return bytes(buffer)
     
     def release(self, _, fh):
         if fh in self.file_handles:

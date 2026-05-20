@@ -199,46 +199,16 @@ def getDownloadLink(url: str):
     return url
 
 def downloadFile(url: str, size: int, offset: int = 0):
-    if size <= 0:
-        return b""
-
-    expected_start = offset
-    expected_end = offset + size - 1
     headers = {
-        "Range": f"bytes={expected_start}-{expected_end}",
+        "Range": f"bytes={offset}-{offset + size - 1}",
         **general_http_client.headers,
     }
-    response = requestWrapper(general_http_client, "GET", url, use_cache=False, headers=headers)
-
-    if response.status_code != httpx.codes.PARTIAL_CONTENT:
-        logging.error(f"Expected HTTP 206 for ranged download, got {response.status_code}")
-        raise Exception(f"Expected HTTP 206 for ranged download, got {response.status_code}")
-
-    content_range = response.headers.get("Content-Range")
-    if not content_range or not content_range.startswith("bytes "):
-        logging.error(f"Missing or invalid Content-Range header: {content_range}")
-        raise Exception(f"Missing or invalid Content-Range header: {content_range}")
-
-    try:
-        range_spec = content_range.split(" ", 1)[1].split("/", 1)[0]
-        returned_start_str, returned_end_str = range_spec.split("-", 1)
-        returned_start = int(returned_start_str)
-        returned_end = int(returned_end_str)
-    except Exception as e:
-        logging.error(f"Failed to parse Content-Range header {content_range}: {e}")
-        raise Exception(f"Failed to parse Content-Range header {content_range}: {e}")
-
-    if returned_start != expected_start or returned_end != expected_end:
-        logging.error(
-            f"Unexpected Content-Range {content_range}, expected bytes {expected_start}-{expected_end}"
-        )
-        raise Exception(
-            f"Unexpected Content-Range {content_range}, expected bytes {expected_start}-{expected_end}"
-        )
-
-    if len(response.content) != size:
-        logging.error(f"Unexpected response length {len(response.content)}, expected {size}")
-        raise Exception(f"Unexpected response length {len(response.content)}, expected {size}")
-
-    return response.content
+    response = requestWrapper(general_http_client, "GET", url, headers=headers)
+    if response.status_code == httpx.codes.OK:
+        return response.content
+    elif response.status_code == httpx.codes.PARTIAL_CONTENT:
+        return response.content
+    else:
+        logging.error(f"Error downloading file: {response.status_code}")
+        raise Exception(f"Error downloading file: {response.status_code}")
 
