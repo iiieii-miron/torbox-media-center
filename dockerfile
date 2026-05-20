@@ -7,8 +7,10 @@ COPY requirements.txt .
 RUN pip install $(grep -v "fuse\|git+" requirements.txt)
 
 # Install build dependencies
-RUN apt-get update && \
-    apt-get install -y git pkg-config libfuse-dev gcc make
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends git pkg-config libfuse-dev gcc make && \
+    rm -rf /var/lib/apt/lists/*
 
 # Architecture-specific installations
 ARG TARGETPLATFORM
