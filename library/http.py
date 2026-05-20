@@ -89,6 +89,9 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
             
             return response
         except httpx.HTTPStatusError as e:
+            if e.response.has_redirect_location:
+                return e.response
+
             bad_response_codes = [429]
             if e.response.status_code in bad_response_codes:
                 wait_time = backoff_factor * (2 ** attempt)
