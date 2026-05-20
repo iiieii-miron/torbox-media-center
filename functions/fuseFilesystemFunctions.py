@@ -145,8 +145,14 @@ class TorBoxMediaCenterFuse(Fuse):
         self.cached_links = {}
 
         self.cache = {}
-        self.block_size = 1024 * 1024 * 64  # 64MB Blocks
-        self.max_blocks = 64 # Max 64 blocks in cache (4GB)
+        self.cache_lock = threading.Lock()
+        self.read_state = {}
+        self.min_window_size = 1024 * 1024  # 1MB
+        self.max_window_size = 1024 * 1024 * 64  # 64MB
+        self.window_growth_factor = 2
+        self.seek_tolerance = 1024 * 512  # 512KB
+        self.state_ttl = 10
+        self.max_segments = 64
 
     def getFiles(self):
         while True:
@@ -198,15 +204,91 @@ class TorBoxMediaCenterFuse(Fuse):
         if (flags & accmode) != os.O_RDONLY:
             return -errno.EACCES
     
+    def _get_cached_segment(self, path, offset, size):
+        request_end = offset + size - 1
+        with self.cache_lock:
+            segments = self.cache.get(path, [])
+            for segment in segments:
+                if segment['start'] <= offset and request_end <= segment['end']:
+                    segment['last_used'] = time.time()
+                    return segment
+        return None
+
+    def _trim_cache(self):
+        total_segments = sum(len(segments) for segments in self.cache.values())
+        limit = self.max_segments * max(1, len(self.cached_links))
+        if total_segments <= limit:
+            return
+
+        all_segments = []
+        for path, segments in self.cache.items():
+            for index, segment in enumerate(segments):
+                all_segments.append((segment['last_used'], path, index))
+        all_segments.sort(key=lambda item: item[0])
+
+        to_remove = total_segments - limit
+        for _, path, index in all_segments[:to_remove]:
+            if path in self.cache and index < len(self.cache[path]):
+                self.cache[path][index] = None
+        for path in list(self.cache.keys()):
+            self.cache[path] = [segment for segment in self.cache[path] if segment is not None]
+            if not self.cache[path]:
+                del self.cache[path]
+
+    def _store_cached_segment(self, path, start, data):
+        end = start + len(data) - 1
+        segment = {
+            'start': start,
+            'end': end,
+            'data': data,
+            'last_used': time.time(),
+        }
+        with self.cache_lock:
+            segments = self.cache.setdefault(path, [])
+            segments = [existing for existing in segments if not (existing['start'] >= start and existing['end'] <= end)]
+            segments.append(segment)
+            segments.sort(key=lambda item: item['start'])
+            self.cache[path] = segments
+            self._trim_cache()
+        return segment
+
+    def _get_next_window_size(self, path, offset, size):
+        now = time.time()
+        state = self.read_state.get(path)
+        sequential = False
+        previous_window = self.min_window_size
+
+        if state and now - state['last_read_ts'] <= self.state_ttl:
+            previous_window = state.get('window_size', self.min_window_size)
+            expected_next = state.get('last_end', 0)
+            if abs(offset - expected_next) <= self.seek_tolerance:
+                sequential = True
+
+        if sequential:
+            window_size = min(previous_window * self.window_growth_factor, self.max_window_size)
+        else:
+            window_size = self.min_window_size
+
+        self.read_state[path] = {
+            'last_offset': offset,
+            'last_size': size,
+            'last_end': offset + size,
+            'last_read_ts': now,
+            'window_size': window_size,
+        }
+        return sequential, window_size
+
     def read(self, path, size, offset):
-        logging.debug(f"READ Path: {path}")
-        logging.debug(f"READ Size: {size}")
-        logging.debug(f"READ Offset: {offset}")
         file = self.vfs.get_file(path)
 
         if not file:
             return -errno.ENOENT
-        
+
+        file_size = file.get('file_size', 0)
+        if offset >= file_size:
+            return b''
+
+        size = min(size, file_size - offset)
         current_time = time.time()
         if path not in self.cached_links:
             self.cached_links[path] = {
@@ -220,40 +302,29 @@ class TorBoxMediaCenterFuse(Fuse):
                 'timestamp': current_time
             }
         download_link = self.cached_links[path]['link']
-        
-        start_block = offset // self.block_size
-        end_block = (offset + size - 1) // self.block_size
-        
-        buffer = bytearray()
-        
-        for block_index in range(start_block, end_block + 1):
-            block_offset = block_index * self.block_size
-            block_end = min((block_index + 1) * self.block_size - 1, file.get('file_size') - 1)
-            current_block_size = block_end - block_offset + 1
-            
-            # check for block
-            if (path, block_index) not in self.cache:
-                logging.debug(f"Cache miss for block {block_index}, fetching...")
-                # get block
-                block_data = downloadFile(download_link, current_block_size, block_offset)
-                if not block_data:
-                    return -errno.EIO
-                # save block to cache
-                self.cache[(path, block_index)] = block_data
-                # lru cache
-                if len(self.cache) > self.max_blocks * len(self.cached_links):
-                    keys_to_remove = list(self.cache.keys())[:len(self.cache) - self.max_blocks]
-                    for key in keys_to_remove:
-                        del self.cache[key]
-            # get block from cache
-            block_data = self.cache[(path, block_index)]
-            
-            start_offset_in_block = max(0, offset - block_offset)
-            end_offset_in_block = min(len(block_data), offset + size - block_offset)
-            
-            buffer.extend(block_data[start_offset_in_block:end_offset_in_block])
-        
-        return bytes(buffer)
+
+        cached_segment = self._get_cached_segment(path, offset, size)
+        sequential, window_size = self._get_next_window_size(path, offset, size)
+        if cached_segment is not None:
+            start = offset - cached_segment['start']
+            end = start + size
+            return bytes(cached_segment['data'][start:end])
+
+        fetch_size = min(max(size, window_size), file_size - offset)
+        started_at = time.time()
+        logging.info(
+            f"SEEKTRACE miss path={path} offset={offset} size={size} sequential={sequential} window_size={window_size} fetch_size={fetch_size}"
+        )
+        data = downloadFile(download_link, fetch_size, offset)
+        if not data:
+            return -errno.EIO
+        segment = self._store_cached_segment(path, offset, data)
+        logging.info(
+            f"SEEKTRACE fetch-done path={path} offset={offset} size={size} fetch_size={fetch_size} received={len(data)} elapsed={time.time() - started_at:.3f}s"
+        )
+        start = offset - segment['start']
+        end = start + size
+        return bytes(segment['data'][start:end])
     
     def release(self, _, fh):
         if fh in self.file_handles:
