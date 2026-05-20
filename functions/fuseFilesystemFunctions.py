@@ -144,9 +144,14 @@ class TorBoxMediaCenterFuse(Fuse):
         self.next_handle = 1
         self.cached_links = {}
 
-        self.cache = {}
-        self.block_size = 1024 * 1024 * 64  # 64MB Blocks
-        self.max_blocks = 64 # Max 64 blocks in cache (4GB)
+        self.segment_cache = {}
+        self.cache_lock = threading.Lock()
+        self.inflight_segments = {}
+        self.inflight_prefetch = {}
+        self.block_size = 1024 * 1024 * 64  # 64MB logical blocks
+        self.segment_size = 1024 * 1024  # 1MB aligned foreground segments
+        self.prefetch_size = 1024 * 1024 * 8  # 8MB background prefetch
+        self.max_segments = 256
 
     def getFiles(self):
         while True:
@@ -198,15 +203,131 @@ class TorBoxMediaCenterFuse(Fuse):
         if (flags & accmode) != os.O_RDONLY:
             return -errno.EACCES
     
+
+    def _trim_cache(self):
+        if len(self.segment_cache) <= self.max_segments * max(1, len(self.cached_links)):
+            return
+        keys_to_remove = sorted(
+            self.segment_cache.keys(),
+            key=lambda key: self.segment_cache[key]['last_used']
+        )[:len(self.segment_cache) - (self.max_segments * max(1, len(self.cached_links)))]
+        for key in keys_to_remove:
+            del self.segment_cache[key]
+
+    def _get_segment(self, path, start):
+        entry = self.segment_cache.get((path, start))
+        if entry is None:
+            return None
+        entry['last_used'] = time.time()
+        return entry['data']
+
+    def _store_segment(self, path, start, data):
+        self.segment_cache[(path, start)] = {
+            'data': data,
+            'last_used': time.time(),
+        }
+        self._trim_cache()
+
+    def _fetch_segment(self, path, start, fetch_size, download_link, event, trace_label):
+        started_at = time.time()
+        try:
+            data = downloadFile(download_link, fetch_size, start)
+            if data:
+                with self.cache_lock:
+                    self._store_segment(path, start, data)
+                logging.info(
+                    f"SEEKTRACE {trace_label}-done path={path} offset={start} fetch_size={fetch_size} received={len(data)} elapsed={time.time() - started_at:.3f}s"
+                )
+        except Exception as e:
+            logging.warning(
+                f"SEEKTRACE {trace_label}-error path={path} offset={start} fetch_size={fetch_size} error={e}"
+            )
+        finally:
+            with self.cache_lock:
+                if trace_label == 'prefetch':
+                    self.inflight_prefetch.pop((path, start), None)
+                else:
+                    self.inflight_segments.pop((path, start), None)
+            event.set()
+
+    def _ensure_prefetch(self, path, start, fetch_size, download_link):
+        with self.cache_lock:
+            if (path, start) in self.segment_cache or (path, start) in self.inflight_segments or (path, start) in self.inflight_prefetch:
+                return
+            event = threading.Event()
+            self.inflight_prefetch[(path, start)] = event
+        logging.info(f"SEEKTRACE prefetch-start path={path} offset={start} fetch_size={fetch_size}")
+        threading.Thread(
+            target=self._fetch_segment,
+            args=(path, start, fetch_size, download_link, event, 'prefetch'),
+            daemon=True,
+        ).start()
+
+    def _read_from_aligned_segments(self, path, offset, size, block_end, download_link):
+        remaining = size
+        current_offset = offset
+        buffer = bytearray()
+
+        while remaining > 0:
+            segment_start = (current_offset // self.segment_size) * self.segment_size
+            segment_end = min(segment_start + self.segment_size - 1, block_end)
+            fetch_size = segment_end - segment_start + 1
+
+            with self.cache_lock:
+                segment_data = self._get_segment(path, segment_start)
+                inflight = self.inflight_segments.get((path, segment_start))
+
+            if segment_data is None and inflight is not None:
+                inflight.wait(timeout=5)
+                with self.cache_lock:
+                    segment_data = self._get_segment(path, segment_start)
+
+            if segment_data is None:
+                event = None
+                with self.cache_lock:
+                    existing = self.inflight_segments.get((path, segment_start))
+                    if existing is None:
+                        event = threading.Event()
+                        self.inflight_segments[(path, segment_start)] = event
+                    else:
+                        event = existing
+                if existing is None:
+                    logging.info(
+                        f"SEEKTRACE miss path={path} offset={current_offset} size={remaining} segment_start={segment_start} fetch_size={fetch_size}"
+                    )
+                    self._fetch_segment(path, segment_start, fetch_size, download_link, event, 'fetch')
+                else:
+                    event.wait(timeout=5)
+                with self.cache_lock:
+                    segment_data = self._get_segment(path, segment_start)
+
+            if segment_data is None:
+                return None
+
+            start_in_segment = current_offset - segment_start
+            take = min(remaining, len(segment_data) - start_in_segment)
+            buffer.extend(segment_data[start_in_segment:start_in_segment + take])
+            current_offset += take
+            remaining -= take
+
+        prefetch_start = ((offset + size) // self.prefetch_size) * self.prefetch_size
+        if prefetch_start <= block_end:
+            prefetch_fetch_size = min(self.prefetch_size, block_end - prefetch_start + 1)
+            self._ensure_prefetch(path, prefetch_start, prefetch_fetch_size, download_link)
+
+        return bytes(buffer)
+
     def read(self, path, size, offset):
-        logging.debug(f"READ Path: {path}")
-        logging.debug(f"READ Size: {size}")
-        logging.debug(f"READ Offset: {offset}")
         file = self.vfs.get_file(path)
 
         if not file:
             return -errno.ENOENT
-        
+
+        file_size = file.get('file_size', 0)
+        if offset >= file_size:
+            return b''
+
+        size = min(size, file_size - offset)
         current_time = time.time()
         if path not in self.cached_links:
             self.cached_links[path] = {
@@ -220,41 +341,16 @@ class TorBoxMediaCenterFuse(Fuse):
                 'timestamp': current_time
             }
         download_link = self.cached_links[path]['link']
-        
-        start_block = offset // self.block_size
-        end_block = (offset + size - 1) // self.block_size
-        
-        buffer = bytearray()
-        
-        for block_index in range(start_block, end_block + 1):
-            block_offset = block_index * self.block_size
-            block_end = min((block_index + 1) * self.block_size - 1, file.get('file_size') - 1)
-            current_block_size = block_end - block_offset + 1
-            
-            # check for block
-            if (path, block_index) not in self.cache:
-                logging.debug(f"Cache miss for block {block_index}, fetching...")
-                # get block
-                block_data = downloadFile(download_link, current_block_size, block_offset)
-                if not block_data:
-                    return -errno.EIO
-                # save block to cache
-                self.cache[(path, block_index)] = block_data
-                # lru cache
-                if len(self.cache) > self.max_blocks * len(self.cached_links):
-                    keys_to_remove = list(self.cache.keys())[:len(self.cache) - self.max_blocks]
-                    for key in keys_to_remove:
-                        del self.cache[key]
-            # get block from cache
-            block_data = self.cache[(path, block_index)]
-            
-            start_offset_in_block = max(0, offset - block_offset)
-            end_offset_in_block = min(len(block_data), offset + size - block_offset)
-            
-            buffer.extend(block_data[start_offset_in_block:end_offset_in_block])
-        
-        return bytes(buffer)
-    
+
+        block_index = offset // self.block_size
+        block_offset = block_index * self.block_size
+        block_end = min((block_index + 1) * self.block_size - 1, file_size - 1)
+
+        data = self._read_from_aligned_segments(path, offset, size, block_end, download_link)
+        if data is None:
+            return -errno.EIO
+        return data
+
     def release(self, _, fh):
         if fh in self.file_handles:
             del self.file_handles[fh]
