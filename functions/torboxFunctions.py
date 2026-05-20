@@ -9,6 +9,7 @@ from functions.databaseFunctions import insertData
 import os
 import logging
 import traceback
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 
