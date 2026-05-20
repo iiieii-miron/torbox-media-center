@@ -199,6 +199,7 @@ class TorBoxMediaCenterFuse(Fuse):
             return -errno.EACCES
     
     def read(self, path, size, offset):
+        read_started_at = time.time()
         logging.debug(f"READ Path: {path}")
         logging.debug(f"READ Size: {size}")
         logging.debug(f"READ Offset: {offset}")
@@ -223,7 +224,11 @@ class TorBoxMediaCenterFuse(Fuse):
         
         start_block = offset // self.block_size
         end_block = (offset + size - 1) // self.block_size
-        
+
+        logging.debug(
+            f"READ plan path={path} offset={offset} size={size} start_block={start_block} end_block={end_block} block_size={self.block_size}"
+        )
+
         buffer = bytearray()
         
         for block_index in range(start_block, end_block + 1):
@@ -233,11 +238,18 @@ class TorBoxMediaCenterFuse(Fuse):
             
             # check for block
             if (path, block_index) not in self.cache:
-                logging.debug(f"Cache miss for block {block_index}, fetching...")
+                logging.debug(
+                    f"Cache miss for block {block_index}, fetching offset={block_offset} size={current_block_size}"
+                )
+                fetch_started_at = time.time()
                 # get block
                 block_data = downloadFile(download_link, current_block_size, block_offset)
+                fetch_elapsed = time.time() - fetch_started_at
                 if not block_data:
                     return -errno.EIO
+                logging.debug(
+                    f"Fetched block {block_index} offset={block_offset} requested={current_block_size} received={len(block_data)} elapsed={fetch_elapsed:.3f}s"
+                )
                 # save block to cache
                 self.cache[(path, block_index)] = block_data
                 # lru cache
@@ -245,6 +257,8 @@ class TorBoxMediaCenterFuse(Fuse):
                     keys_to_remove = list(self.cache.keys())[:len(self.cache) - self.max_blocks]
                     for key in keys_to_remove:
                         del self.cache[key]
+            else:
+                logging.debug(f"Cache hit for block {block_index}")
             # get block from cache
             block_data = self.cache[(path, block_index)]
             
@@ -253,7 +267,11 @@ class TorBoxMediaCenterFuse(Fuse):
             
             buffer.extend(block_data[start_offset_in_block:end_offset_in_block])
         
-        return bytes(buffer)
+        result = bytes(buffer)
+        logging.debug(
+            f"READ done path={path} offset={offset} size={size} returned={len(result)} elapsed={time.time() - read_started_at:.3f}s"
+        )
+        return result
     
     def release(self, _, fh):
         if fh in self.file_handles:

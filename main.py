@@ -3,14 +3,25 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from functions.appFunctions import bootUp, getMountMethod, getAllUserDownloadsFresh, getMountRefreshTime
 from functions.databaseFunctions import closeAllDatabases
 import logging
+import os
 from sys import platform
 
+
+def get_log_level(name: str, default: str) -> int:
+    value = os.getenv(name, default).upper()
+    return getattr(logging, value, getattr(logging, default.upper(), logging.INFO))
+
+
+app_log_level = get_log_level("LOG_LEVEL", "INFO")
+httpx_log_level = get_log_level("HTTPX_LOG_LEVEL", os.getenv("LOG_LEVEL", "WARNING"))
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=app_log_level,
     format='%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(httpx_log_level)
+logging.getLogger("httpcore").setLevel(httpx_log_level)
 
 if __name__ == "__main__":
     bootUp()
