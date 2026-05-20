@@ -13,6 +13,10 @@ CACHE_TTL = 300 # cache time-to-live in seconds
 _cache: dict[str, tuple[float, httpx.Response]] = {}
 
 def makeCacheKey(method: str, url: str, base_url: str, **kwargs) -> str:
+    headers = kwargs.get("headers")
+    if headers is not None:
+        headers = {str(k).lower(): str(v) for k, v in dict(headers).items()}
+
     key_data = {
         "method": method,
         "url": url,
@@ -20,6 +24,7 @@ def makeCacheKey(method: str, url: str, base_url: str, **kwargs) -> str:
         "params": kwargs.get("params"),
         "json": kwargs.get("json"),
         "data": kwargs.get("data"),
+        "headers": headers,
     }
     key_str = json.dumps(key_data, sort_keys=True, default=str)
     return hashlib.sha256(key_str.encode()).hexdigest()
@@ -64,8 +69,10 @@ general_http_client = httpx.Client(
 def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool = True, **kwargs) -> httpx.Response:
     max_retries = 5
     backoff_factor = 1.5
-    
-    cacheable = use_cache and method.upper() == "GET" # only caching GET requests
+
+    headers = kwargs.get("headers") or {}
+    has_range_header = any(str(k).lower() == "range" for k in dict(headers).keys())
+    cacheable = use_cache and method.upper() == "GET" and not has_range_header # only cache non-range GET requests
     cache_key = None
     
     if cacheable:
