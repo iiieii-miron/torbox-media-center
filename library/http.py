@@ -90,6 +90,9 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
             return response
         except httpx.HTTPStatusError as e:
             if e.response.has_redirect_location:
+                if cacheable and cache_key:
+                    _cache[cache_key] = (time.time(), e.response)
+                    logging.debug(f"Cached redirect response for {url}")
                 return e.response
 
             bad_response_codes = [429]
