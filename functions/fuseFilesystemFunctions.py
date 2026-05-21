@@ -285,10 +285,12 @@ class TorBoxMediaCenterFuse(Fuse):
             return
         with self.cache_lock:
             if (
-                self._find_covering_segment(path, start, fetch_size) is not None
+                self._find_covering_segment(path, start, 1) is not None
+                or self._find_covering_inflight_prefetch(path, start, 1) is not None
                 or (path, start) in self.inflight_segments
                 or (path, start) in self.inflight_prefetch
             ):
+                logging.debug(f"SEEKTRACE prefetch-skip-covered path={path} offset={start} fetch_size={fetch_size}")
                 return
             event = threading.Event()
             self.inflight_prefetch[(path, start)] = {
