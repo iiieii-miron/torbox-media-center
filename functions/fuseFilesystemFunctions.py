@@ -149,6 +149,7 @@ class TorBoxMediaCenterFuse(Fuse):
         )
         self.cache_lock = threading.Lock()
         self.inflight_prefetch = {}
+        self.last_read_ahead_start = {}
         self.block_size = 1024 * 1024 * 64  # 64MB logical blocks
         self.segment_size = 1024 * FUSE_FOREGROUND_SEGMENT_KB
         self.prefetch_size = 1024 * 1024 * FUSE_PREFETCH_WINDOW_MB
@@ -491,7 +492,8 @@ class TorBoxMediaCenterFuse(Fuse):
             remaining -= take
 
         prefetch_start = ((offset + size + self.segment_size - 1) // self.segment_size) * self.segment_size
-        if prefetch_start < file_size:
+        if prefetch_start < file_size and self.last_read_ahead_start.get(path) != prefetch_start:
+            self.last_read_ahead_start[path] = prefetch_start
             prefetch_block_end = min(
                 ((prefetch_start // self.block_size) + 1) * self.block_size - 1,
                 file_size - 1,
