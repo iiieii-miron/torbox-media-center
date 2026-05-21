@@ -156,6 +156,7 @@ class TorBoxMediaCenterFuse(Fuse):
         self.prefetch_wait_seconds = FUSE_PREFETCH_WAIT_MS / 1000
         self.prefetch_min_age_seconds = FUSE_PREFETCH_MIN_AGE_MS / 1000
         self.seek_cancel_gap = max(self.prefetch_size * 2, self.block_size)
+        self.next_stream_trigger_bytes = min(4 * 1024 * 1024, max(self.prefetch_size // 2, self.segment_size))
 
         self._refreshFiles()
         threading.Thread(target=self.getFiles, daemon=True).start()
@@ -427,6 +428,7 @@ class TorBoxMediaCenterFuse(Fuse):
                 'condition': threading.Condition(),
                 'done': False,
                 'cancelled': False,
+                'max_served_offset': start - 1,
             }
             entry = self.inflight_prefetch[(path, start)]
         logging.info(f"SEEKTRACE prefetch-stream-start path={path} offset={start} fetch_size={fetch_size} reason={reason}")
@@ -440,6 +442,13 @@ class TorBoxMediaCenterFuse(Fuse):
     def _ensure_next_stream(self, path, entry, file_size, download_link):
         next_start = entry['end'] + 1
         if next_start >= file_size:
+            return None
+
+        served_bytes = entry.get('max_served_offset', entry['start'] - 1) - entry['start'] + 1
+        if served_bytes < self.next_stream_trigger_bytes:
+            logging.debug(
+                f"SEEKTRACE stream-next-wait path={path} offset={next_start} served={served_bytes} threshold={self.next_stream_trigger_bytes} previous_start={entry['start']} previous_end={entry['end']}"
+            )
             return None
 
         with self.cache_lock:
@@ -517,6 +526,10 @@ class TorBoxMediaCenterFuse(Fuse):
                 if stream_entry is not None:
                     stream_data = self._read_from_inflight_entry(stream_entry, current_offset, requested_size, timeout=5)
                     if stream_data is not None:
+                        stream_entry['max_served_offset'] = max(
+                            stream_entry.get('max_served_offset', stream_entry['start'] - 1),
+                            current_offset + len(stream_data) - 1,
+                        )
                         self._ensure_next_stream(path, stream_entry, file_size, download_link)
                         buffer.extend(stream_data)
                         current_offset += len(stream_data)
