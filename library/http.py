@@ -106,8 +106,9 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
                 except ValueError:
                     wait_time = backoff_factor * (2 ** attempt)
                 wait_time += random.uniform(0, 0.5)
-                logging.warning(f"HTTPTRACE retryable-status status={e.response.status_code} attempt={attempt + 1}/{max_retries} url={url} retry_after={retry_after} wait={wait_time:.2f}")
-                logging.warning(f"Received {e.response.status_code} for {url}. Retrying in {wait_time:.2f} seconds...")
+                response_body = e.response.text[:1000].replace("\n", " ")
+                logging.warning(f"HTTPTRACE retryable-status status={e.response.status_code} attempt={attempt + 1}/{max_retries} url={url} retry_after={retry_after} wait={wait_time:.2f} body={response_body}")
+                logging.warning(f"Received {e.response.status_code} for {url}. Retrying in {wait_time:.2f} seconds. Body: {response_body}")
                 time.sleep(wait_time)
             else:
                 logging.error(f"HTTP error for {url}: {e}")
