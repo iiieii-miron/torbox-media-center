@@ -1,4 +1,4 @@
-from library.app import RAW_MODE, FUSE_FOREGROUND_SEGMENT_KB, FUSE_PREFETCH_WINDOW_MB, FUSE_PREFETCH_WAIT_MS
+from library.app import RAW_MODE, FUSE_FOREGROUND_SEGMENT_KB, FUSE_PREFETCH_WINDOW_MB, FUSE_PREFETCH_WAIT_MS, FUSE_PREFETCH_MIN_AGE_MS
 import os
 from library.filesystem import MOUNT_PATH
 import stat
@@ -154,6 +154,7 @@ class TorBoxMediaCenterFuse(Fuse):
         self.segment_size = 1024 * FUSE_FOREGROUND_SEGMENT_KB
         self.prefetch_size = 1024 * 1024 * FUSE_PREFETCH_WINDOW_MB
         self.prefetch_wait_seconds = FUSE_PREFETCH_WAIT_MS / 1000
+        self.prefetch_min_age_seconds = FUSE_PREFETCH_MIN_AGE_MS / 1000
 
         self._refreshFiles()
         threading.Thread(target=self.getFiles, daemon=True).start()
@@ -319,6 +320,7 @@ class TorBoxMediaCenterFuse(Fuse):
                 'start': start,
                 'end': start + fetch_size - 1,
                 'event': event,
+                'started_at': time.time(),
             }
         logging.info(f"SEEKTRACE prefetch-start path={path} offset={start} fetch_size={fetch_size}")
         threading.Thread(
@@ -356,12 +358,14 @@ class TorBoxMediaCenterFuse(Fuse):
                     segment_entry = self._find_covering_segment(path, current_offset, requested_size)
 
             if segment_entry is None and inflight_prefetch is not None and self.prefetch_wait_seconds > 0:
-                logging.info(
-                    f"SEEKTRACE wait-prefetch path={path} offset={current_offset} size={requested_size} prefetch_start={inflight_prefetch['start']} prefetch_end={inflight_prefetch['end']} timeout={self.prefetch_wait_seconds:.3f}s"
-                )
-                inflight_prefetch['event'].wait(timeout=self.prefetch_wait_seconds)
-                with self.cache_lock:
-                    segment_entry = self._find_covering_segment(path, current_offset, requested_size)
+                prefetch_age = time.time() - inflight_prefetch['started_at']
+                if prefetch_age >= self.prefetch_min_age_seconds:
+                    logging.info(
+                        f"SEEKTRACE wait-prefetch path={path} offset={current_offset} size={requested_size} prefetch_start={inflight_prefetch['start']} prefetch_end={inflight_prefetch['end']} timeout={self.prefetch_wait_seconds:.3f}s age={prefetch_age:.3f}s"
+                    )
+                    inflight_prefetch['event'].wait(timeout=self.prefetch_wait_seconds)
+                    with self.cache_lock:
+                        segment_entry = self._find_covering_segment(path, current_offset, requested_size)
 
             if segment_entry is None:
                 event = None

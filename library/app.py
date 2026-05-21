@@ -11,6 +11,7 @@ METADATA_SEARCH_MIN_INTERVAL = max(0.0, float(os.getenv("METADATA_SEARCH_MIN_INT
 FUSE_FOREGROUND_SEGMENT_KB = max(64, int(os.getenv("FUSE_FOREGROUND_SEGMENT_KB", "1024")))
 FUSE_PREFETCH_WINDOW_MB = max(1, int(os.getenv("FUSE_PREFETCH_WINDOW_MB", "8")))
 FUSE_PREFETCH_WAIT_MS = max(0, int(os.getenv("FUSE_PREFETCH_WAIT_MS", "150")))
+FUSE_PREFETCH_MIN_AGE_MS = max(0, int(os.getenv("FUSE_PREFETCH_MIN_AGE_MS", "600")))
 
 class MountRefreshTimes(Enum):
     # times are shown in hours
