@@ -8,6 +8,9 @@ SCAN_METADATA = os.getenv("ENABLE_METADATA", "false").lower() == "true"
 RAW_MODE = os.getenv("RAW_MODE", "false").lower() == "true"
 METADATA_MAX_WORKERS = max(1, int(os.getenv("METADATA_MAX_WORKERS", "2")))
 METADATA_SEARCH_MIN_INTERVAL = max(0.0, float(os.getenv("METADATA_SEARCH_MIN_INTERVAL", "0.75")))
+FUSE_FOREGROUND_SEGMENT_KB = max(64, int(os.getenv("FUSE_FOREGROUND_SEGMENT_KB", "1024")))
+FUSE_PREFETCH_WINDOW_MB = max(1, int(os.getenv("FUSE_PREFETCH_WINDOW_MB", "8")))
+FUSE_PREFETCH_WAIT_MS = max(0, int(os.getenv("FUSE_PREFETCH_WAIT_MS", "150")))
 
 class MountRefreshTimes(Enum):
     # times are shown in hours

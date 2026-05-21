@@ -1,4 +1,4 @@
-from library.app import RAW_MODE
+from library.app import RAW_MODE, FUSE_FOREGROUND_SEGMENT_KB, FUSE_PREFETCH_WINDOW_MB, FUSE_PREFETCH_WAIT_MS
 import os
 from library.filesystem import MOUNT_PATH
 import stat
@@ -153,8 +153,9 @@ class TorBoxMediaCenterFuse(Fuse):
         self.inflight_segments = {}
         self.inflight_prefetch = {}
         self.block_size = 1024 * 1024 * 64  # 64MB logical blocks
-        self.segment_size = 1024 * 1024  # 1MB aligned foreground segments
-        self.prefetch_size = 1024 * 1024 * 8  # 8MB background prefetch
+        self.segment_size = 1024 * FUSE_FOREGROUND_SEGMENT_KB
+        self.prefetch_size = 1024 * 1024 * FUSE_PREFETCH_WINDOW_MB
+        self.prefetch_wait_seconds = FUSE_PREFETCH_WAIT_MS / 1000
 
     def getFiles(self):
         while True:
@@ -330,11 +331,11 @@ class TorBoxMediaCenterFuse(Fuse):
                 with self.cache_lock:
                     segment_entry = self._find_covering_segment(path, current_offset, requested_size)
 
-            if segment_entry is None and inflight_prefetch is not None:
+            if segment_entry is None and inflight_prefetch is not None and self.prefetch_wait_seconds > 0:
                 logging.info(
-                    f"SEEKTRACE wait-prefetch path={path} offset={current_offset} size={requested_size} prefetch_start={inflight_prefetch['start']} prefetch_end={inflight_prefetch['end']}"
+                    f"SEEKTRACE wait-prefetch path={path} offset={current_offset} size={requested_size} prefetch_start={inflight_prefetch['start']} prefetch_end={inflight_prefetch['end']} timeout={self.prefetch_wait_seconds:.3f}s"
                 )
-                inflight_prefetch['event'].wait(timeout=5)
+                inflight_prefetch['event'].wait(timeout=self.prefetch_wait_seconds)
                 with self.cache_lock:
                     segment_entry = self._find_covering_segment(path, current_offset, requested_size)
 
@@ -369,7 +370,7 @@ class TorBoxMediaCenterFuse(Fuse):
             current_offset += take
             remaining -= take
 
-        prefetch_start = ((offset + size) // self.prefetch_size) * self.prefetch_size
+        prefetch_start = ((offset + size + self.segment_size - 1) // self.segment_size) * self.segment_size
         if prefetch_start < file_size:
             prefetch_block_end = min(
                 ((prefetch_start // self.block_size) + 1) * self.block_size - 1,
