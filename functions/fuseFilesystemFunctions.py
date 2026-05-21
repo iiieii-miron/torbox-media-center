@@ -240,6 +240,18 @@ class TorBoxMediaCenterFuse(Fuse):
             'last_used': time.time(),
         }
 
+    def _find_covering_inflight_prefetch(self, path, offset, size):
+        if size <= 0:
+            return None
+
+        request_end = offset + size - 1
+        for (entry_path, _), entry in self.inflight_prefetch.items():
+            if entry_path != path:
+                continue
+            if entry['start'] <= offset and request_end <= entry['end']:
+                return entry
+        return None
+
     def _fetch_segment(self, path, start, fetch_size, download_link, event, trace_label):
         started_at = time.time()
         try:
@@ -278,7 +290,11 @@ class TorBoxMediaCenterFuse(Fuse):
             ):
                 return
             event = threading.Event()
-            self.inflight_prefetch[(path, start)] = event
+            self.inflight_prefetch[(path, start)] = {
+                'start': start,
+                'end': start + fetch_size - 1,
+                'event': event,
+            }
         logging.info(f"SEEKTRACE prefetch-start path={path} offset={start} fetch_size={fetch_size}")
         threading.Thread(
             target=self._fetch_segment,
@@ -307,9 +323,18 @@ class TorBoxMediaCenterFuse(Fuse):
             with self.cache_lock:
                 segment_entry = self._find_covering_segment(path, current_offset, requested_size)
                 inflight = self.inflight_segments.get((path, segment_start))
+                inflight_prefetch = self._find_covering_inflight_prefetch(path, current_offset, requested_size)
 
             if segment_entry is None and inflight is not None:
                 inflight.wait(timeout=5)
+                with self.cache_lock:
+                    segment_entry = self._find_covering_segment(path, current_offset, requested_size)
+
+            if segment_entry is None and inflight_prefetch is not None:
+                logging.info(
+                    f"SEEKTRACE wait-prefetch path={path} offset={current_offset} size={requested_size} prefetch_start={inflight_prefetch['start']} prefetch_end={inflight_prefetch['end']}"
+                )
+                inflight_prefetch['event'].wait(timeout=5)
                 with self.cache_lock:
                     segment_entry = self._find_covering_segment(path, current_offset, requested_size)
 
