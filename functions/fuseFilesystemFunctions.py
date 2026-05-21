@@ -365,6 +365,15 @@ class TorBoxMediaCenterFuse(Fuse):
             if segment_entry is None:
                 return None
 
+            next_window_start = fetch_start + self.read_window_size
+            if next_window_start < file_size:
+                next_block_end = min(
+                    ((next_window_start // self.block_size) + 1) * self.block_size - 1,
+                    file_size - 1,
+                )
+                next_fetch_size = min(self.prefetch_size, next_block_end - next_window_start + 1)
+                self._ensure_prefetch(path, next_window_start, next_fetch_size, download_link)
+
             start_in_segment = current_offset - segment_entry['start']
             take = min(remaining, len(segment_entry['data']) - start_in_segment)
             if take <= 0:
