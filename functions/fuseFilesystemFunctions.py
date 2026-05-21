@@ -240,9 +240,25 @@ class TorBoxMediaCenterFuse(Fuse):
         return matched_entry
 
     def _store_segment(self, path, start, data):
+        end = start + len(data) - 1
+        existing_entry = self._find_covering_segment(path, start, len(data))
+        if existing_entry is not None:
+            logging.debug(
+                f"SEEKTRACE store-skip-covered path={path} offset={start} size={len(data)} covered_start={existing_entry['start']} covered_end={existing_entry['end']}"
+            )
+            return
+
+        exact_entry = self.segment_cache.get((path, start))
+        if exact_entry is not None and exact_entry['end'] >= end:
+            exact_entry['last_used'] = time.time()
+            logging.debug(
+                f"SEEKTRACE store-skip-smaller path={path} offset={start} size={len(data)} existing_end={exact_entry['end']}"
+            )
+            return
+
         self.segment_cache[(path, start)] = {
             'start': start,
-            'end': start + len(data) - 1,
+            'end': end,
             'data': data,
             'last_used': time.time(),
         }
