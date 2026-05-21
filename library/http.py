@@ -82,8 +82,6 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
     for attempt in range(max_retries):
         try:
             response = client.request(method, url, **kwargs)
-            if str(client.base_url).startswith(TORBOX_SEARCH_API_URL):
-                logging.info(f"HTTPTRACE search-response status={response.status_code} attempt={attempt + 1}/{max_retries} url={url}")
             response.raise_for_status()
             
             if cacheable and cache_key:
@@ -107,7 +105,6 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
                     wait_time = backoff_factor * (2 ** attempt)
                 wait_time += random.uniform(0, 0.5)
                 response_body = e.response.text[:1000].replace("\n", " ")
-                logging.warning(f"HTTPTRACE retryable-status status={e.response.status_code} attempt={attempt + 1}/{max_retries} url={url} retry_after={retry_after} wait={wait_time:.2f} body={response_body}")
                 logging.warning(f"Received {e.response.status_code} for {url}. Retrying in {wait_time:.2f} seconds. Body: {response_body}")
                 time.sleep(wait_time)
             else:

@@ -245,17 +245,11 @@ class TorBoxMediaCenterFuse(Fuse):
         end = start + len(data) - 1
         existing_entry = self._find_covering_segment(path, start, len(data))
         if existing_entry is not None:
-            logging.debug(
-                f"SEEKTRACE store-skip-covered path={path} offset={start} size={len(data)} covered_start={existing_entry['start']} covered_end={existing_entry['end']}"
-            )
             return
 
         exact_entry = self.segment_cache.get((path, start))
         if exact_entry is not None and exact_entry['end'] >= end:
             exact_entry['last_used'] = time.time()
-            logging.debug(
-                f"SEEKTRACE store-skip-smaller path={path} offset={start} size={len(data)} existing_end={exact_entry['end']}"
-            )
             return
 
         self.segment_cache[(path, start)] = {
@@ -308,7 +302,7 @@ class TorBoxMediaCenterFuse(Fuse):
         try:
             if fetch_size <= 0:
                 logging.warning(
-                    f"SEEKTRACE {trace_label}-skip path={path} offset={start} fetch_size={fetch_size}"
+                    f"Skipping stream window with non-positive size: path={path} offset={start} fetch_size={fetch_size}"
                 )
                 return
 
@@ -320,16 +314,16 @@ class TorBoxMediaCenterFuse(Fuse):
                 with self.cache_lock:
                     self._store_segment(path, start, data)
             if cancelled:
-                logging.info(
-                    f"SEEKTRACE {trace_label}-stream-cancelled path={path} offset={start} fetch_size={fetch_size} received={received} elapsed={time.time() - started_at:.3f}s"
+                logging.debug(
+                    f"Stream window cancelled: path={path} offset={start} fetch_size={fetch_size} received={received} elapsed={time.time() - started_at:.3f}s"
                 )
             else:
-                logging.info(
-                    f"SEEKTRACE {trace_label}-stream-done path={path} offset={start} fetch_size={fetch_size} received={received} elapsed={time.time() - started_at:.3f}s"
+                logging.debug(
+                    f"Stream window completed: path={path} offset={start} fetch_size={fetch_size} received={received} elapsed={time.time() - started_at:.3f}s"
                 )
         except Exception as e:
             logging.warning(
-                f"SEEKTRACE {trace_label}-stream-error path={path} offset={start} fetch_size={fetch_size} error={e}"
+                f"Stream window failed: path={path} offset={start} fetch_size={fetch_size} error={e}"
             )
         finally:
             with entry['condition']:
@@ -366,8 +360,8 @@ class TorBoxMediaCenterFuse(Fuse):
                 cancelled.append((start, entry['end']))
 
         for start, end in cancelled:
-            logging.info(
-                f"SEEKTRACE stream-cancel path={path} old_start={start} old_end={end} new_offset={offset} reason=seek"
+            logging.debug(
+                f"Cancelled stale stream window after seek: path={path} old_start={start} old_end={end} new_offset={offset}"
             )
 
     def _ensure_prefetch(self, path, start, fetch_size, download_link, reason='miss'):
@@ -378,16 +372,13 @@ class TorBoxMediaCenterFuse(Fuse):
             self._cancel_stale_streams_for_seek(path, start)
         with self.cache_lock:
             if self._find_covering_segment(path, start, 1) is not None:
-                logging.debug(f"SEEKTRACE prefetch-skip-covered path={path} offset={start} fetch_size={fetch_size} reason={reason}")
                 return None
 
             existing_prefetch = self._find_covering_inflight_prefetch(path, start, 1)
             if existing_prefetch is not None:
-                logging.debug(f"SEEKTRACE prefetch-join path={path} offset={start} fetch_size={fetch_size} reason={reason} existing_start={existing_prefetch['start']} existing_end={existing_prefetch['end']}")
                 return existing_prefetch
 
             if (path, start) in self.inflight_prefetch:
-                logging.debug(f"SEEKTRACE prefetch-skip-inflight path={path} offset={start} fetch_size={fetch_size} reason={reason}")
                 return self.inflight_prefetch.get((path, start))
 
             event = threading.Event()
@@ -404,7 +395,7 @@ class TorBoxMediaCenterFuse(Fuse):
                 'max_served_offset': start - 1,
             }
             entry = self.inflight_prefetch[(path, start)]
-        logging.info(f"SEEKTRACE prefetch-stream-start path={path} offset={start} fetch_size={fetch_size} reason={reason}")
+        logging.debug(f"Starting stream window: path={path} offset={start} fetch_size={fetch_size} reason={reason}")
         threading.Thread(
             target=self._fetch_segment_stream,
             args=(path, start, fetch_size, download_link, entry, 'prefetch'),
@@ -419,17 +410,11 @@ class TorBoxMediaCenterFuse(Fuse):
 
         served_bytes = entry.get('max_served_offset', entry['start'] - 1) - entry['start'] + 1
         if served_bytes < self.next_stream_trigger_bytes:
-            logging.debug(
-                f"SEEKTRACE stream-next-wait path={path} offset={next_start} served={served_bytes} threshold={self.next_stream_trigger_bytes} previous_start={entry['start']} previous_end={entry['end']}"
-            )
             return None
 
         with self.cache_lock:
             inflight_for_path = sum(1 for (entry_path, _), _entry in self.inflight_prefetch.items() if entry_path == path)
         if inflight_for_path >= 2:
-            logging.debug(
-                f"SEEKTRACE stream-next-skip path={path} offset={next_start} reason=too-many-inflight count={inflight_for_path}"
-            )
             return None
 
         next_block_end = min(
@@ -440,9 +425,6 @@ class TorBoxMediaCenterFuse(Fuse):
         if next_fetch_size <= 0:
             return None
 
-        logging.debug(
-            f"SEEKTRACE stream-next path={path} offset={next_start} fetch_size={next_fetch_size} previous_start={entry['start']} previous_end={entry['end']}"
-        )
         return self._ensure_prefetch(path, next_start, next_fetch_size, download_link, reason='next-window')
 
     def _read_from_aligned_segments(self, path, offset, size, file_size, download_link):
@@ -470,9 +452,6 @@ class TorBoxMediaCenterFuse(Fuse):
             if segment_entry is None and inflight_prefetch is not None and self.prefetch_wait_seconds > 0:
                 prefetch_age = time.time() - inflight_prefetch['started_at']
                 if prefetch_age >= self.prefetch_min_age_seconds:
-                    logging.info(
-                        f"SEEKTRACE wait-prefetch path={path} offset={current_offset} size={requested_size} prefetch_start={inflight_prefetch['start']} prefetch_end={inflight_prefetch['end']} timeout={self.prefetch_wait_seconds:.3f}s age={prefetch_age:.3f}s"
-                    )
                     inflight_prefetch['event'].wait(timeout=self.prefetch_wait_seconds)
                     with self.cache_lock:
                         segment_entry = self._find_covering_segment(path, current_offset, requested_size)
@@ -480,14 +459,8 @@ class TorBoxMediaCenterFuse(Fuse):
             if segment_entry is None:
                 if inflight_prefetch is not None:
                     stream_entry = inflight_prefetch
-                    logging.info(
-                        f"SEEKTRACE stream-join path={path} offset={current_offset} size={remaining} stream_start={stream_entry['start']} stream_end={stream_entry['end']} needed={requested_size}"
-                    )
                 else:
                     stream_fetch_size = min(self.prefetch_size, current_block_end - segment_start + 1)
-                    logging.info(
-                        f"SEEKTRACE stream-miss path={path} offset={current_offset} size={remaining} segment_start={segment_start} fetch_size={stream_fetch_size} needed={requested_size}"
-                    )
                     stream_entry = self._ensure_prefetch(path, segment_start, stream_fetch_size, download_link, reason='miss')
 
                 if stream_entry is not None:
@@ -509,9 +482,6 @@ class TorBoxMediaCenterFuse(Fuse):
             if segment_entry is None:
                 return None
 
-            logging.debug(
-                f"SEEKTRACE stream-cache-hit path={path} offset={current_offset} size={requested_size} segment_start={segment_entry['start']} segment_end={segment_entry['end']}"
-            )
             start_in_segment = current_offset - segment_entry['start']
             take = min(remaining, len(segment_entry['data']) - start_in_segment)
             if take <= 0:
