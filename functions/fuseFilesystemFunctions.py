@@ -487,7 +487,6 @@ class TorBoxMediaCenterFuse(Fuse):
             logging.debug(
                 f"SEEKTRACE stream-cache-hit path={path} offset={current_offset} size={requested_size} segment_start={segment_entry['start']} segment_end={segment_entry['end']}"
             )
-            self._ensure_next_stream(path, segment_entry, file_size, download_link)
             start_in_segment = current_offset - segment_entry['start']
             take = min(remaining, len(segment_entry['data']) - start_in_segment)
             if take <= 0:
