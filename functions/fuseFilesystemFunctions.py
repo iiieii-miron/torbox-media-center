@@ -1,4 +1,4 @@
-from library.app import RAW_MODE
+from library.app import RAW_MODE, FUSE_READ_WINDOW_MB, FUSE_PREFETCH_WINDOW_MB
 import os
 from library.filesystem import MOUNT_PATH
 import stat
@@ -153,8 +153,9 @@ class TorBoxMediaCenterFuse(Fuse):
         self.inflight_segments = {}
         self.inflight_prefetch = {}
         self.block_size = 1024 * 1024 * 64  # 64MB logical blocks
-        self.segment_size = 1024 * 1024  # 1MB aligned foreground segments
-        self.prefetch_size = 1024 * 1024 * 8  # 8MB background prefetch
+        self.segment_size = 1024 * 1024  # 1MB aligned lookup granularity
+        self.read_window_size = 1024 * 1024 * FUSE_READ_WINDOW_MB
+        self.prefetch_size = 1024 * 1024 * FUSE_PREFETCH_WINDOW_MB
 
     def getFiles(self):
         while True:
@@ -309,12 +310,15 @@ class TorBoxMediaCenterFuse(Fuse):
 
         while remaining > 0:
             segment_start = (current_offset // self.segment_size) * self.segment_size
+            read_window_start = (current_offset // self.read_window_size) * self.read_window_size
             current_block_end = min(
                 ((current_offset // self.block_size) + 1) * self.block_size - 1,
                 file_size - 1,
             )
             segment_end = min(segment_start + self.segment_size - 1, current_block_end)
-            fetch_size = segment_end - segment_start + 1
+            read_window_end = min(read_window_start + self.read_window_size - 1, current_block_end)
+            fetch_start = read_window_start
+            fetch_size = read_window_end - fetch_start + 1
             requested_size = min(remaining, segment_end - current_offset + 1)
 
             if fetch_size <= 0 or requested_size <= 0:
@@ -322,7 +326,7 @@ class TorBoxMediaCenterFuse(Fuse):
 
             with self.cache_lock:
                 segment_entry = self._find_covering_segment(path, current_offset, requested_size)
-                inflight = self.inflight_segments.get((path, segment_start))
+                inflight = self.inflight_segments.get((path, fetch_start))
                 inflight_prefetch = self._find_covering_inflight_prefetch(path, current_offset, requested_size)
 
             if segment_entry is None and inflight is not None:
@@ -342,17 +346,17 @@ class TorBoxMediaCenterFuse(Fuse):
                 event = None
                 existing = None
                 with self.cache_lock:
-                    existing = self.inflight_segments.get((path, segment_start))
+                    existing = self.inflight_segments.get((path, fetch_start))
                     if existing is None:
                         event = threading.Event()
-                        self.inflight_segments[(path, segment_start)] = event
+                        self.inflight_segments[(path, fetch_start)] = event
                     else:
                         event = existing
                 if existing is None:
                     logging.info(
-                        f"SEEKTRACE miss path={path} offset={current_offset} size={remaining} segment_start={segment_start} fetch_size={fetch_size}"
+                        f"SEEKTRACE miss path={path} offset={current_offset} size={remaining} segment_start={segment_start} fetch_start={fetch_start} fetch_size={fetch_size}"
                     )
-                    self._fetch_segment(path, segment_start, fetch_size, download_link, event, 'fetch')
+                    self._fetch_segment(path, fetch_start, fetch_size, download_link, event, 'fetch')
                 else:
                     event.wait(timeout=5)
                 with self.cache_lock:
