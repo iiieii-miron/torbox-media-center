@@ -356,21 +356,21 @@ class TorBoxMediaCenterFuse(Fuse):
                     self.inflight_segments.pop((path, start), None)
             event.set()
 
-    def _ensure_prefetch(self, path, start, fetch_size, download_link):
+    def _ensure_prefetch(self, path, start, fetch_size, download_link, reason='miss'):
         if fetch_size <= 0:
             return None
         with self.cache_lock:
             if self._find_covering_segment(path, start, 1) is not None:
-                logging.debug(f"SEEKTRACE prefetch-skip-covered path={path} offset={start} fetch_size={fetch_size}")
+                logging.debug(f"SEEKTRACE prefetch-skip-covered path={path} offset={start} fetch_size={fetch_size} reason={reason}")
                 return None
 
             existing_prefetch = self._find_covering_inflight_prefetch(path, start, 1)
             if existing_prefetch is not None:
-                logging.debug(f"SEEKTRACE prefetch-join path={path} offset={start} fetch_size={fetch_size} existing_start={existing_prefetch['start']} existing_end={existing_prefetch['end']}")
+                logging.debug(f"SEEKTRACE prefetch-join path={path} offset={start} fetch_size={fetch_size} reason={reason} existing_start={existing_prefetch['start']} existing_end={existing_prefetch['end']}")
                 return existing_prefetch
 
             if (path, start) in self.inflight_segments or (path, start) in self.inflight_prefetch:
-                logging.debug(f"SEEKTRACE prefetch-skip-inflight path={path} offset={start} fetch_size={fetch_size}")
+                logging.debug(f"SEEKTRACE prefetch-skip-inflight path={path} offset={start} fetch_size={fetch_size} reason={reason}")
                 return self.inflight_prefetch.get((path, start))
 
             event = threading.Event()
@@ -384,13 +384,39 @@ class TorBoxMediaCenterFuse(Fuse):
                 'done': False,
             }
             entry = self.inflight_prefetch[(path, start)]
-        logging.info(f"SEEKTRACE prefetch-stream-start path={path} offset={start} fetch_size={fetch_size}")
+        logging.info(f"SEEKTRACE prefetch-stream-start path={path} offset={start} fetch_size={fetch_size} reason={reason}")
         threading.Thread(
             target=self._fetch_segment_stream,
             args=(path, start, fetch_size, download_link, entry, 'prefetch'),
             daemon=True,
         ).start()
         return entry
+
+    def _ensure_next_stream(self, path, entry, file_size, download_link):
+        next_start = entry['end'] + 1
+        if next_start >= file_size:
+            return None
+
+        with self.cache_lock:
+            inflight_for_path = sum(1 for (entry_path, _), _entry in self.inflight_prefetch.items() if entry_path == path)
+        if inflight_for_path >= 2:
+            logging.debug(
+                f"SEEKTRACE stream-next-skip path={path} offset={next_start} reason=too-many-inflight count={inflight_for_path}"
+            )
+            return None
+
+        next_block_end = min(
+            ((next_start // self.block_size) + 1) * self.block_size - 1,
+            file_size - 1,
+        )
+        next_fetch_size = min(self.prefetch_size, next_block_end - next_start + 1)
+        if next_fetch_size <= 0:
+            return None
+
+        logging.debug(
+            f"SEEKTRACE stream-next path={path} offset={next_start} fetch_size={next_fetch_size} previous_start={entry['start']} previous_end={entry['end']}"
+        )
+        return self._ensure_prefetch(path, next_start, next_fetch_size, download_link, reason='next-window')
 
     def _read_from_aligned_segments(self, path, offset, size, file_size, download_link):
         remaining = size
@@ -431,14 +457,22 @@ class TorBoxMediaCenterFuse(Fuse):
                         segment_entry = self._find_covering_segment(path, current_offset, requested_size)
 
             if segment_entry is None:
-                stream_fetch_size = min(self.prefetch_size, current_block_end - segment_start + 1)
-                logging.info(
-                    f"SEEKTRACE stream-miss path={path} offset={current_offset} size={remaining} segment_start={segment_start} fetch_size={stream_fetch_size} needed={requested_size}"
-                )
-                stream_entry = self._ensure_prefetch(path, segment_start, stream_fetch_size, download_link)
+                if inflight_prefetch is not None:
+                    stream_entry = inflight_prefetch
+                    logging.info(
+                        f"SEEKTRACE stream-join path={path} offset={current_offset} size={remaining} stream_start={stream_entry['start']} stream_end={stream_entry['end']} needed={requested_size}"
+                    )
+                else:
+                    stream_fetch_size = min(self.prefetch_size, current_block_end - segment_start + 1)
+                    logging.info(
+                        f"SEEKTRACE stream-miss path={path} offset={current_offset} size={remaining} segment_start={segment_start} fetch_size={stream_fetch_size} needed={requested_size}"
+                    )
+                    stream_entry = self._ensure_prefetch(path, segment_start, stream_fetch_size, download_link, reason='miss')
+
                 if stream_entry is not None:
                     stream_data = self._read_from_inflight_entry(stream_entry, current_offset, requested_size, timeout=5)
                     if stream_data is not None:
+                        self._ensure_next_stream(path, stream_entry, file_size, download_link)
                         buffer.extend(stream_data)
                         current_offset += len(stream_data)
                         remaining -= len(stream_data)
@@ -450,6 +484,9 @@ class TorBoxMediaCenterFuse(Fuse):
             if segment_entry is None:
                 return None
 
+            logging.debug(
+                f"SEEKTRACE stream-cache-hit path={path} offset={current_offset} size={requested_size} segment_start={segment_entry['start']} segment_end={segment_entry['end']}"
+            )
             start_in_segment = current_offset - segment_entry['start']
             take = min(remaining, len(segment_entry['data']) - start_in_segment)
             if take <= 0:
@@ -465,7 +502,7 @@ class TorBoxMediaCenterFuse(Fuse):
                 file_size - 1,
             )
             prefetch_fetch_size = min(self.prefetch_size, prefetch_block_end - prefetch_start + 1)
-            self._ensure_prefetch(path, prefetch_start, prefetch_fetch_size, download_link)
+            self._ensure_prefetch(path, prefetch_start, prefetch_fetch_size, download_link, reason='read-ahead')
 
         return bytes(buffer)
 
