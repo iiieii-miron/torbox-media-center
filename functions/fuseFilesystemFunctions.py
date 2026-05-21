@@ -3,7 +3,7 @@ import os
 from library.filesystem import MOUNT_PATH
 import stat
 import errno
-from functions.torboxFunctions import getDownloadLink, downloadFile, streamDownloadFile
+from functions.torboxFunctions import getDownloadLink, streamDownloadFile
 import time
 import sys
 import logging
@@ -148,7 +148,6 @@ class TorBoxMediaCenterFuse(Fuse):
             getsizeof=lambda entry: len(entry['data']),
         )
         self.cache_lock = threading.Lock()
-        self.inflight_segments = {}
         self.inflight_prefetch = {}
         self.block_size = 1024 * 1024 * 64  # 64MB logical blocks
         self.segment_size = 1024 * FUSE_FOREGROUND_SEGMENT_KB
@@ -340,32 +339,6 @@ class TorBoxMediaCenterFuse(Fuse):
                 self.inflight_prefetch.pop((path, start), None)
             entry['event'].set()
 
-    def _fetch_segment(self, path, start, fetch_size, download_link, event, trace_label):
-        started_at = time.time()
-        try:
-            if fetch_size <= 0:
-                logging.warning(
-                    f"SEEKTRACE {trace_label}-skip path={path} offset={start} fetch_size={fetch_size}"
-                )
-                return
-            data = downloadFile(download_link, fetch_size, start)
-            if data:
-                with self.cache_lock:
-                    self._store_segment(path, start, data)
-                logging.info(
-                    f"SEEKTRACE {trace_label}-done path={path} offset={start} fetch_size={fetch_size} received={len(data)} elapsed={time.time() - started_at:.3f}s"
-                )
-        except Exception as e:
-            logging.warning(
-                f"SEEKTRACE {trace_label}-error path={path} offset={start} fetch_size={fetch_size} error={e}"
-            )
-        finally:
-            with self.cache_lock:
-                if trace_label == 'prefetch':
-                    self.inflight_prefetch.pop((path, start), None)
-                else:
-                    self.inflight_segments.pop((path, start), None)
-            event.set()
 
     def _cancel_stale_streams_for_seek(self, path, offset):
         cancelled = []
@@ -413,7 +386,7 @@ class TorBoxMediaCenterFuse(Fuse):
                 logging.debug(f"SEEKTRACE prefetch-join path={path} offset={start} fetch_size={fetch_size} reason={reason} existing_start={existing_prefetch['start']} existing_end={existing_prefetch['end']}")
                 return existing_prefetch
 
-            if (path, start) in self.inflight_segments or (path, start) in self.inflight_prefetch:
+            if (path, start) in self.inflight_prefetch:
                 logging.debug(f"SEEKTRACE prefetch-skip-inflight path={path} offset={start} fetch_size={fetch_size} reason={reason}")
                 return self.inflight_prefetch.get((path, start))
 
@@ -492,13 +465,7 @@ class TorBoxMediaCenterFuse(Fuse):
 
             with self.cache_lock:
                 segment_entry = self._find_covering_segment(path, current_offset, requested_size)
-                inflight = self.inflight_segments.get((path, segment_start))
                 inflight_prefetch = self._find_covering_inflight_prefetch(path, current_offset, requested_size)
-
-            if segment_entry is None and inflight is not None:
-                inflight.wait(timeout=5)
-                with self.cache_lock:
-                    segment_entry = self._find_covering_segment(path, current_offset, requested_size)
 
             if segment_entry is None and inflight_prefetch is not None and self.prefetch_wait_seconds > 0:
                 prefetch_age = time.time() - inflight_prefetch['started_at']
