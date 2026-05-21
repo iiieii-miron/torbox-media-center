@@ -70,7 +70,7 @@ class VirtualFileSystem:
                     structure[path] = set()
                 structure[path].add(f.get('metadata_filename'))
                 
-            elif media_type == 'series':
+            elif media_type == 'series' or media_type == 'anime':
                 path = f'/series/{root_folder}'
                 structure['/series'].add(root_folder)
                 
@@ -101,7 +101,7 @@ class VirtualFileSystem:
                 if f.get('metadata_mediatype') == 'movie':
                     path = f'/movies/{f.get("metadata_rootfoldername")}/{f.get("metadata_filename")}'
                     file_map[path] = f
-                else:  # series
+                elif f.get('metadata_mediatype') == 'series' or f.get('metadata_mediatype') == 'anime':
                     path = f'/series/{f.get("metadata_rootfoldername")}/{f.get("metadata_foldername")}/{f.get("metadata_filename")}'
                     file_map[path] = f
 

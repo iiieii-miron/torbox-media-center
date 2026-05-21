@@ -32,6 +32,49 @@ ACCEPTABLE_MIME_TYPES = [
     "video/mp4",
 ]
 
+TYPE_TAG_PREFIX = "type="
+
+
+def _iter_tag_values(value):
+    if value is None:
+        return
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, nested_value in value.items():
+            yield f"{key}={nested_value}"
+            yield from _iter_tag_values(nested_value)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_tag_values(item)
+
+
+def getManualMediaType(item: dict):
+    for field in ("tags", "tag", "labels", "label"):
+        for tag in _iter_tag_values(item.get(field)) or []:
+            normalized_tag = str(tag).strip().lower()
+            if normalized_tag.startswith(TYPE_TAG_PREFIX):
+                media_type = normalized_tag[len(TYPE_TAG_PREFIX):].strip()
+                if media_type in {"movie", "series", "anime"}:
+                    return media_type
+    return None
+
+
+def applyManualMediaType(metadata: dict, media_type: str, title_data: dict, file_name: str, item_name: str):
+    if media_type not in {"movie", "series", "anime"}:
+        return metadata
+
+    metadata["metadata_mediatype"] = media_type
+    metadata["metadata_rootfoldername"] = item_name
+    metadata["metadata_filename"] = file_name
+
+    if media_type in {"series", "anime"}:
+        metadata["metadata_foldername"] = constructSeriesTitle(season=title_data.get("season", 1), folder=True)
+        metadata["metadata_season"] = title_data.get("season", 1)
+        metadata["metadata_episode"] = title_data.get("episode")
+
+    return metadata
+
 def process_file(item, file, type):
     """Process a single file and return the processed data"""
     if not file.get("mimetype").startswith("video/") or file.get("mimetype") not in ACCEPTABLE_MIME_TYPES:
@@ -60,6 +103,10 @@ def process_file(item, file, type):
         item["name"] = title_data.get("title", file.get("short_name"))
 
     metadata, _, _ = searchMetadata(title_data.get("title", file.get("short_name")), title_data, file.get("short_name"), f"{item.get('name')} {file.get('short_name')}", item.get("hash"), item.get("name"))
+    manual_media_type = getManualMediaType(file) or getManualMediaType(item)
+    if manual_media_type:
+        logging.info(f"METATRACE manual-type media_type={manual_media_type} item={item.get('name')} file={file.get('short_name')} hash={item.get('hash')}")
+        metadata = applyManualMediaType(metadata, manual_media_type, title_data, file.get("short_name"), item.get("name"))
     data.update(metadata)
     logging.debug(data)
     insertData(data, type.value)
