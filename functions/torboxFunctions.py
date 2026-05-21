@@ -171,17 +171,23 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
         base_metadata["metadata_rootfoldername"] = item_name
         return base_metadata, False, "Metadata scanning is disabled."
     extension = os.path.splitext(file_name)[-1]
+    metadata_url = f"/meta/search/{full_title}"
     try:
+        logging.info(f"METATRACE search-start query={query} file={file_name} hash={hash}")
         _throttle_metadata_search()
-        response = requestWrapper(search_api_http_client, "GET", f"/meta/search/{full_title}", params={"type": "file"})
+        response = requestWrapper(search_api_http_client, "GET", metadata_url, params={"type": "file"})
     except Exception as e:
+        logging.error(f"METATRACE search-error query={query} file={file_name} hash={hash} error={e}")
         logging.error(f"Error searching metadata: {e}")
         return base_metadata, False, f"Error searching metadata: {e}. Searching for {query}, item hash: {hash}"
     if response.status_code != 200:
+        logging.error(f"METATRACE search-bad-status status={response.status_code} query={query} file={file_name} hash={hash} body={response.text[:500]}")
         logging.error(f"Error searching metadata: {response.status_code}. {response.text}")
         return base_metadata, False, f"Error searching metadata. {response.status_code}. Searching for {query}, item hash: {hash}"
     try:
-        data = response.json().get("data", [])[0]
+        results = response.json().get("data", [])
+        logging.info(f"METATRACE search-success query={query} file={file_name} hash={hash} results={len(results)}")
+        data = results[0]
 
         title = cleanTitle(data.get("title"))
         base_metadata["metadata_title"] = title
@@ -196,6 +202,7 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
         elif data.get("type") == "movie":
             file_name = f"{title} ({base_metadata['metadata_years']}){extension}"
         else:
+            logging.info(f"METATRACE search-unsupported-type type={data.get('type')} query={query} file={file_name} hash={hash}")
             return base_metadata, False, f"No metadata found. Searching for {query}, item hash: {hash}"
             
         base_metadata["metadata_filename"] = file_name
@@ -205,12 +212,16 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
         base_metadata["metadata_backdrop"] = data.get("backdrop")
         base_metadata["metadata_rootfoldername"] = f"{title} ({base_metadata['metadata_years']})"
 
+        logging.info(f"METATRACE metadata-found type={data.get('type')} title={title} query={query} file={file_name} hash={hash}")
         return base_metadata, True, f"Metadata found. Searching for {query}, item hash: {hash}"
     except IndexError:
+        logging.info(f"METATRACE search-empty query={query} file={file_name} hash={hash}")
         return base_metadata, False, f"No metadata found. Searching for {query}, item hash: {hash}"
     except httpx.TimeoutException:
+        logging.warning(f"METATRACE search-timeout query={query} file={file_name} hash={hash}")
         return base_metadata, False, f"Timeout searching metadata. Searching for {query}, item hash: {hash}"
     except Exception as e:
+        logging.error(f"METATRACE parse-error query={query} file={file_name} hash={hash} error={e}")
         logging.error(f"Error searching metadata: {e}")
         logging.error(f"Error searching metadata: {traceback.format_exc()}")
         return base_metadata, False, f"Error searching metadata: {e}. Searching for {query}, item hash: {hash}"
