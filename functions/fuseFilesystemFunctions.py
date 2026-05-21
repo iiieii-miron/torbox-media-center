@@ -10,6 +10,7 @@ import logging
 from functions.appFunctions import getAllUserDownloads
 import threading
 from sys import platform
+from cachetools import LRUCache
 
 # Pull in some spaghetti to make this stuff work without fuse-py being installed
 try:
@@ -144,14 +145,16 @@ class TorBoxMediaCenterFuse(Fuse):
         self.next_handle = 1
         self.cached_links = {}
 
-        self.segment_cache = {}
+        self.segment_cache = LRUCache(
+            maxsize=512 * 1024 * 1024,  # 512MB across all cached ranges
+            getsizeof=lambda entry: len(entry['data']),
+        )
         self.cache_lock = threading.Lock()
         self.inflight_segments = {}
         self.inflight_prefetch = {}
         self.block_size = 1024 * 1024 * 64  # 64MB logical blocks
         self.segment_size = 1024 * 1024  # 1MB aligned foreground segments
         self.prefetch_size = 1024 * 1024 * 8  # 8MB background prefetch
-        self.max_segments = 256
 
     def getFiles(self):
         while True:
@@ -204,33 +207,47 @@ class TorBoxMediaCenterFuse(Fuse):
             return -errno.EACCES
     
 
-    def _trim_cache(self):
-        if len(self.segment_cache) <= self.max_segments * max(1, len(self.cached_links)):
-            return
-        keys_to_remove = sorted(
-            self.segment_cache.keys(),
-            key=lambda key: self.segment_cache[key]['last_used']
-        )[:len(self.segment_cache) - (self.max_segments * max(1, len(self.cached_links)))]
-        for key in keys_to_remove:
-            del self.segment_cache[key]
-
-    def _get_segment(self, path, start):
-        entry = self.segment_cache.get((path, start))
-        if entry is None:
+    def _find_covering_segment(self, path, offset, size):
+        if size <= 0:
             return None
-        entry['last_used'] = time.time()
-        return entry['data']
+
+        request_end = offset + size - 1
+        matched_key = None
+        matched_entry = None
+
+        for key, entry in self.segment_cache.items():
+            entry_path, _ = key
+            if entry_path != path:
+                continue
+            if entry['start'] <= offset and request_end <= entry['end']:
+                matched_key = key
+                matched_entry = entry
+                break
+
+        if matched_key is None:
+            return None
+
+        # Touch the entry so cachetools can maintain LRU ordering.
+        matched_entry = self.segment_cache[matched_key]
+        matched_entry['last_used'] = time.time()
+        return matched_entry
 
     def _store_segment(self, path, start, data):
         self.segment_cache[(path, start)] = {
+            'start': start,
+            'end': start + len(data) - 1,
             'data': data,
             'last_used': time.time(),
         }
-        self._trim_cache()
 
     def _fetch_segment(self, path, start, fetch_size, download_link, event, trace_label):
         started_at = time.time()
         try:
+            if fetch_size <= 0:
+                logging.warning(
+                    f"SEEKTRACE {trace_label}-skip path={path} offset={start} fetch_size={fetch_size}"
+                )
+                return
             data = downloadFile(download_link, fetch_size, start)
             if data:
                 with self.cache_lock:
@@ -251,8 +268,14 @@ class TorBoxMediaCenterFuse(Fuse):
             event.set()
 
     def _ensure_prefetch(self, path, start, fetch_size, download_link):
+        if fetch_size <= 0:
+            return
         with self.cache_lock:
-            if (path, start) in self.segment_cache or (path, start) in self.inflight_segments or (path, start) in self.inflight_prefetch:
+            if (
+                self._find_covering_segment(path, start, fetch_size) is not None
+                or (path, start) in self.inflight_segments
+                or (path, start) in self.inflight_prefetch
+            ):
                 return
             event = threading.Event()
             self.inflight_prefetch[(path, start)] = event
@@ -263,27 +286,36 @@ class TorBoxMediaCenterFuse(Fuse):
             daemon=True,
         ).start()
 
-    def _read_from_aligned_segments(self, path, offset, size, block_end, download_link):
+    def _read_from_aligned_segments(self, path, offset, size, file_size, download_link):
         remaining = size
         current_offset = offset
         buffer = bytearray()
 
         while remaining > 0:
             segment_start = (current_offset // self.segment_size) * self.segment_size
-            segment_end = min(segment_start + self.segment_size - 1, block_end)
+            current_block_end = min(
+                ((current_offset // self.block_size) + 1) * self.block_size - 1,
+                file_size - 1,
+            )
+            segment_end = min(segment_start + self.segment_size - 1, current_block_end)
             fetch_size = segment_end - segment_start + 1
+            requested_size = min(remaining, segment_end - current_offset + 1)
+
+            if fetch_size <= 0 or requested_size <= 0:
+                return None
 
             with self.cache_lock:
-                segment_data = self._get_segment(path, segment_start)
+                segment_entry = self._find_covering_segment(path, current_offset, requested_size)
                 inflight = self.inflight_segments.get((path, segment_start))
 
-            if segment_data is None and inflight is not None:
+            if segment_entry is None and inflight is not None:
                 inflight.wait(timeout=5)
                 with self.cache_lock:
-                    segment_data = self._get_segment(path, segment_start)
+                    segment_entry = self._find_covering_segment(path, current_offset, requested_size)
 
-            if segment_data is None:
+            if segment_entry is None:
                 event = None
+                existing = None
                 with self.cache_lock:
                     existing = self.inflight_segments.get((path, segment_start))
                     if existing is None:
@@ -299,20 +331,26 @@ class TorBoxMediaCenterFuse(Fuse):
                 else:
                     event.wait(timeout=5)
                 with self.cache_lock:
-                    segment_data = self._get_segment(path, segment_start)
+                    segment_entry = self._find_covering_segment(path, current_offset, requested_size)
 
-            if segment_data is None:
+            if segment_entry is None:
                 return None
 
-            start_in_segment = current_offset - segment_start
-            take = min(remaining, len(segment_data) - start_in_segment)
-            buffer.extend(segment_data[start_in_segment:start_in_segment + take])
+            start_in_segment = current_offset - segment_entry['start']
+            take = min(remaining, len(segment_entry['data']) - start_in_segment)
+            if take <= 0:
+                return None
+            buffer.extend(segment_entry['data'][start_in_segment:start_in_segment + take])
             current_offset += take
             remaining -= take
 
         prefetch_start = ((offset + size) // self.prefetch_size) * self.prefetch_size
-        if prefetch_start <= block_end:
-            prefetch_fetch_size = min(self.prefetch_size, block_end - prefetch_start + 1)
+        if prefetch_start < file_size:
+            prefetch_block_end = min(
+                ((prefetch_start // self.block_size) + 1) * self.block_size - 1,
+                file_size - 1,
+            )
+            prefetch_fetch_size = min(self.prefetch_size, prefetch_block_end - prefetch_start + 1)
             self._ensure_prefetch(path, prefetch_start, prefetch_fetch_size, download_link)
 
         return bytes(buffer)
@@ -342,11 +380,7 @@ class TorBoxMediaCenterFuse(Fuse):
             }
         download_link = self.cached_links[path]['link']
 
-        block_index = offset // self.block_size
-        block_offset = block_index * self.block_size
-        block_end = min((block_index + 1) * self.block_size - 1, file_size - 1)
-
-        data = self._read_from_aligned_segments(path, offset, size, block_end, download_link)
+        data = self._read_from_aligned_segments(path, offset, size, file_size, download_link)
         if data is None:
             return -errno.EIO
         return data
