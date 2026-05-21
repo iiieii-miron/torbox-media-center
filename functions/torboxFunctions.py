@@ -294,7 +294,7 @@ def downloadFile(url: str, size: int, offset: int = 0):
         raise Exception(f"Error downloading file: {response.status_code}")
 
 
-def streamDownloadFile(url: str, size: int, offset: int = 0, on_chunk=None, chunk_size: int = 256 * 1024):
+def streamDownloadFile(url: str, size: int, offset: int = 0, on_chunk=None, chunk_size: int = 256 * 1024, should_cancel=None):
     headers = {
         "Range": f"bytes={offset}-{offset + size - 1}",
         **general_http_client.headers,
@@ -308,10 +308,14 @@ def streamDownloadFile(url: str, size: int, offset: int = 0, on_chunk=None, chun
 
         received = 0
         for chunk in response.iter_bytes(chunk_size=chunk_size):
+            if should_cancel and should_cancel():
+                break
             if not chunk:
                 continue
             received += len(chunk)
             if on_chunk:
                 on_chunk(chunk)
+            if should_cancel and should_cancel():
+                break
         return received
     

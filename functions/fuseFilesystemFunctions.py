@@ -155,6 +155,7 @@ class TorBoxMediaCenterFuse(Fuse):
         self.prefetch_size = 1024 * 1024 * FUSE_PREFETCH_WINDOW_MB
         self.prefetch_wait_seconds = FUSE_PREFETCH_WAIT_MS / 1000
         self.prefetch_min_age_seconds = FUSE_PREFETCH_MIN_AGE_MS / 1000
+        self.seek_cancel_gap = max(self.prefetch_size * 2, self.block_size)
 
         self._refreshFiles()
         threading.Thread(target=self.getFiles, daemon=True).start()
@@ -301,6 +302,9 @@ class TorBoxMediaCenterFuse(Fuse):
                 entry['buffer'].extend(chunk)
                 entry['condition'].notify_all()
 
+        def should_cancel():
+            return entry['cancel_event'].is_set()
+
         try:
             if fetch_size <= 0:
                 logging.warning(
@@ -308,15 +312,21 @@ class TorBoxMediaCenterFuse(Fuse):
                 )
                 return
 
-            received = streamDownloadFile(download_link, fetch_size, start, on_chunk=on_chunk)
+            received = streamDownloadFile(download_link, fetch_size, start, on_chunk=on_chunk, should_cancel=should_cancel)
+            cancelled = entry['cancel_event'].is_set()
             with entry['condition']:
                 data = bytes(entry['buffer'])
-            if data:
+            if data and not cancelled:
                 with self.cache_lock:
                     self._store_segment(path, start, data)
-            logging.info(
-                f"SEEKTRACE {trace_label}-stream-done path={path} offset={start} fetch_size={fetch_size} received={received} elapsed={time.time() - started_at:.3f}s"
-            )
+            if cancelled:
+                logging.info(
+                    f"SEEKTRACE {trace_label}-stream-cancelled path={path} offset={start} fetch_size={fetch_size} received={received} elapsed={time.time() - started_at:.3f}s"
+                )
+            else:
+                logging.info(
+                    f"SEEKTRACE {trace_label}-stream-done path={path} offset={start} fetch_size={fetch_size} received={received} elapsed={time.time() - started_at:.3f}s"
+                )
         except Exception as e:
             logging.warning(
                 f"SEEKTRACE {trace_label}-stream-error path={path} offset={start} fetch_size={fetch_size} error={e}"
@@ -356,9 +366,42 @@ class TorBoxMediaCenterFuse(Fuse):
                     self.inflight_segments.pop((path, start), None)
             event.set()
 
+    def _cancel_stale_streams_for_seek(self, path, offset):
+        cancelled = []
+        with self.cache_lock:
+            entries = list(self.inflight_prefetch.items())
+            relevant_entries = [
+                ((entry_path, start), entry)
+                for (entry_path, start), entry in entries
+                if entry_path == path and not entry.get('done') and not entry.get('cancelled')
+            ]
+            if not relevant_entries:
+                return
+
+            near_existing_stream = False
+            for (_, _), entry in relevant_entries:
+                if entry['start'] - self.seek_cancel_gap <= offset <= entry['end'] + self.seek_cancel_gap:
+                    near_existing_stream = True
+                    break
+            if near_existing_stream:
+                return
+
+            for (entry_path, start), entry in relevant_entries:
+                entry['cancelled'] = True
+                entry['cancel_event'].set()
+                cancelled.append((start, entry['end']))
+
+        for start, end in cancelled:
+            logging.info(
+                f"SEEKTRACE stream-cancel path={path} old_start={start} old_end={end} new_offset={offset} reason=seek"
+            )
+
     def _ensure_prefetch(self, path, start, fetch_size, download_link, reason='miss'):
         if fetch_size <= 0:
             return None
+        # Tiny tail/metadata probes should not cancel active playback streams.
+        if reason == 'miss' and fetch_size >= min(self.prefetch_size, self.block_size) // 2:
+            self._cancel_stale_streams_for_seek(path, start)
         with self.cache_lock:
             if self._find_covering_segment(path, start, 1) is not None:
                 logging.debug(f"SEEKTRACE prefetch-skip-covered path={path} offset={start} fetch_size={fetch_size} reason={reason}")
@@ -378,10 +421,12 @@ class TorBoxMediaCenterFuse(Fuse):
                 'start': start,
                 'end': start + fetch_size - 1,
                 'event': event,
+                'cancel_event': threading.Event(),
                 'started_at': time.time(),
                 'buffer': bytearray(),
                 'condition': threading.Condition(),
                 'done': False,
+                'cancelled': False,
             }
             entry = self.inflight_prefetch[(path, start)]
         logging.info(f"SEEKTRACE prefetch-stream-start path={path} offset={start} fetch_size={fetch_size} reason={reason}")
