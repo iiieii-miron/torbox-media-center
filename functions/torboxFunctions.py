@@ -3,7 +3,7 @@ import httpx
 from enum import Enum
 import PTN
 from library.torbox import TORBOX_API_KEY
-from library.app import SCAN_METADATA
+from library.app import SCAN_METADATA, METADATA_MAX_WORKERS, METADATA_SEARCH_MIN_INTERVAL
 from functions.mediaFunctions import constructSeriesTitle, cleanTitle, cleanYear
 from functions.databaseFunctions import insertData
 import os
@@ -11,6 +11,11 @@ import logging
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
+import threading
+import time
+
+_metadata_search_lock = threading.Lock()
+_last_metadata_search_at = 0.0
 
 class DownloadType(Enum):
     torrent = "torrents"
@@ -99,9 +104,12 @@ def getUserDownloads(type: DownloadType):
     
     files = []
     
-    # Get the number of CPU cores for parallel processing
-    max_workers = int(multiprocessing.cpu_count() * 2 - 1)
-    logging.info(f"Processing files with {max_workers} parallel threads")
+    if SCAN_METADATA:
+        max_workers = METADATA_MAX_WORKERS
+        logging.info(f"Processing files with {max_workers} parallel threads for metadata scanning")
+    else:
+        max_workers = int(multiprocessing.cpu_count() * 2 - 1)
+        logging.info(f"Processing files with {max_workers} parallel threads")
     
     # Collect all files to process
     files_to_process = []
@@ -132,6 +140,20 @@ def getUserDownloads(type: DownloadType):
             
     return files, True, f"{type.value.capitalize()} fetched successfully."
 
+def _throttle_metadata_search():
+    global _last_metadata_search_at
+
+    if METADATA_SEARCH_MIN_INTERVAL <= 0:
+        return
+
+    with _metadata_search_lock:
+        now = time.monotonic()
+        wait_time = METADATA_SEARCH_MIN_INTERVAL - (now - _last_metadata_search_at)
+        if wait_time > 0:
+            time.sleep(wait_time)
+        _last_metadata_search_at = time.monotonic()
+
+
 def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str, hash: str, item_name: str):
     base_metadata = {
         "metadata_title": cleanTitle(query),
@@ -150,6 +172,7 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
         return base_metadata, False, "Metadata scanning is disabled."
     extension = os.path.splitext(file_name)[-1]
     try:
+        _throttle_metadata_search()
         response = requestWrapper(search_api_http_client, "GET", f"/meta/search/{full_title}", params={"type": "file"})
     except Exception as e:
         logging.error(f"Error searching metadata: {e}")

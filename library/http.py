@@ -5,6 +5,7 @@ import time
 import logging
 import hashlib
 import json
+import random
 
 TORBOX_API_URL = "https://api.torbox.app/v1/api"
 TORBOX_SEARCH_API_URL = "https://search-api.torbox.app"
@@ -97,7 +98,12 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
 
             bad_response_codes = [429]
             if e.response.status_code in bad_response_codes:
-                wait_time = backoff_factor * (2 ** attempt)
+                retry_after = e.response.headers.get("Retry-After")
+                try:
+                    wait_time = float(retry_after) if retry_after else backoff_factor * (2 ** attempt)
+                except ValueError:
+                    wait_time = backoff_factor * (2 ** attempt)
+                wait_time += random.uniform(0, 0.5)
                 logging.warning(f"Received {e.response.status_code} for {url}. Retrying in {wait_time:.2f} seconds...")
                 time.sleep(wait_time)
             else:

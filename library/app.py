@@ -6,6 +6,8 @@ load_dotenv()
 
 SCAN_METADATA = os.getenv("ENABLE_METADATA", "false").lower() == "true"
 RAW_MODE = os.getenv("RAW_MODE", "false").lower() == "true"
+METADATA_MAX_WORKERS = max(1, int(os.getenv("METADATA_MAX_WORKERS", "2")))
+METADATA_SEARCH_MIN_INTERVAL = max(0.0, float(os.getenv("METADATA_SEARCH_MIN_INTERVAL", "0.75")))
 
 class MountRefreshTimes(Enum):
     # times are shown in hours
@@ -27,7 +29,7 @@ if MOUNT_REFRESH_TIME == "instant":
 if SCAN_METADATA and RAW_MODE:
     SCAN_METADATA = False
     print("!!! RAW_MODE IS NOT COMPATIBLE WITH METADATA SCANNING. Disabling metadata scanning. !!!")
-else:
+elif SCAN_METADATA:
     print("!!! Metadata scanning is enabled. This may slow down the processing of files. !!!")
 
 if MOUNT_REFRESH_TIME == "instant" and SCAN_METADATA:
