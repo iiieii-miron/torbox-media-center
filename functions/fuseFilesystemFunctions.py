@@ -137,8 +137,6 @@ class TorBoxMediaCenterFuse(Fuse):
     def __init__(self, *args, **kwargs):
         super(TorBoxMediaCenterFuse, self).__init__(*args, **kwargs)
 
-        threading.Thread(target=self.getFiles, daemon=True).start()
-
         self.files = []
         self.vfs = VirtualFileSystem(self.files)
         self.file_handles = {}
@@ -157,13 +155,21 @@ class TorBoxMediaCenterFuse(Fuse):
         self.prefetch_size = 1024 * 1024 * FUSE_PREFETCH_WINDOW_MB
         self.prefetch_wait_seconds = FUSE_PREFETCH_WAIT_MS / 1000
 
+        self._refreshFiles()
+        threading.Thread(target=self.getFiles, daemon=True).start()
+
+    def _refreshFiles(self):
+        files = getAllUserDownloads()
+        if files:
+            self.files = files
+            self.vfs = VirtualFileSystem(self.files)
+            logging.info(f"Updated {len(self.files)} files in VFS")
+        else:
+            logging.warning("No files loaded into VFS yet; keeping previous VFS state")
+
     def getFiles(self):
         while True:
-            files = getAllUserDownloads()
-            if files:
-                self.files = files
-                self.vfs = VirtualFileSystem(self.files)
-                logging.debug(f"Updated {len(self.files)} files in VFS")
+            self._refreshFiles()
             time.sleep(300)
         
     def getattr(self, path):
